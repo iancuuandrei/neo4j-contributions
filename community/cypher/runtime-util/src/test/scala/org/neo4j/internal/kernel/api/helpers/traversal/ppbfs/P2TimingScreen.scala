@@ -153,6 +153,21 @@ class P2TimingScreen extends RuntimeUtilTestSuite with PGPathPropagatingBFSTestB
     (b.build(), source)
   }
 
+  /**
+   * Layered fanout graph for large-k falsification: source -> L0 (w nodes, complete) ->
+   * L1 (f nodes, complete bipartite) . An L0 node reached in B branch states has k=B actives,
+   * each expanding over F rels, giving g/i ≈ B*F from a single bucket iteration.
+   */
+  private def fanoutLayerGraph(w: Int, f: Int): (InMemoryGraph, Long) = {
+    val b = InMemoryGraph.builder
+    val source = b.node()
+    val l0 = (0 until w).map(_ => b.node())
+    val l1 = (0 until f).map(_ => b.node())
+    l0.foreach(m => b.rel(source, m))
+    for (m <- l0; n <- l1) b.rel(m, n)
+    (b.build(), source)
+  }
+
   private def workloads(): Seq[Workload] = {
     val (c2000, cSrc) = chainGraph(2000)
     val (star2000, starSrc, starLeaf) = starGraph(2000)
@@ -180,6 +195,11 @@ class P2TimingScreen extends RuntimeUtilTestSuite with PGPathPropagatingBFSTestB
     val h3starget = h3sb.node()
     h3mid.foreach(m => h3sb.rel(m, h3starget))
     val h3sgraph = h3sb.build()
+    // Large-k falsification family (Part I): layered fanout graphs x branch NFAs.
+    // Rows per workload = W*F*B traced paths; both variants pay tracing equally.
+    val (fanW2F2, fanW2F2Src) = fanoutLayerGraph(2, 2)
+    val (fanW2F8, fanW2F8Src) = fanoutLayerGraph(2, 8)
+    val (grid20, grid20Src) = gridGraph(20, 20)
     Seq(
       Workload("chain2000-s255", c2000, cSrc, repChainNfa(126), repeats = 10),
       Workload("chain2000-s509", c2000, cSrc, repChainNfa(252), repeats = 10),
@@ -213,7 +233,21 @@ class P2TimingScreen extends RuntimeUtilTestSuite with PGPathPropagatingBFSTestB
         repeats = 10
       ),
       Workload("diamond-dense-s18", dia, diaSrc, branchNfa(16, 0), repeats = 10),
-      Workload("tiny-chain500-s4", c500, c500Src, nfa("s" |> ("a" --> "b") |> "t"), repeats = 30)
+      Workload("tiny-chain500-s4", c500, c500Src, nfa("s" |> ("a" --> "b") |> "t"), repeats = 30),
+      // Large-k falsifiers: k = max actives at an L0 bucket; S = 2+B+U.
+      Workload("k32-s34", fanW2F2, fanW2F2Src, branchNfa(32, 0), repeats = 10),
+      Workload("k32-s258", fanW2F2, fanW2F2Src, branchNfa(32, 224), repeats = 10),
+      Workload("k64-s66", fanW2F2, fanW2F2Src, branchNfa(64, 0), repeats = 10),
+      Workload("k64-s514", fanW2F2, fanW2F2Src, branchNfa(64, 448), repeats = 5),
+      Workload("k128-s130", fanW2F2, fanW2F2Src, branchNfa(128, 0), repeats = 5),
+      Workload("k128-s1026", fanW2F2, fanW2F2Src, branchNfa(128, 896), repeats = 3),
+      Workload("k256-s258", fanW2F2, fanW2F2Src, branchNfa(256, 0), repeats = 3),
+      // Hostile high-g/i: F=8 fanout multiplies exact lookups per large-k bucket.
+      Workload("hostile-k32-f8", fanW2F8, fanW2F8Src, branchNfa(32, 0), repeats = 5),
+      Workload("hostile-k64-f8", fanW2F8, fanW2F8Src, branchNfa(64, 0), repeats = 3),
+      Workload("hostile-k128-f8", fanW2F8, fanW2F8Src, branchNfa(128, 0), repeats = 2),
+      // Deep-repeat merge pressure (C4 retired index activates at depth>=8 with revisits).
+      Workload("grid-deep-merge-s31", grid20, grid20Src, repChainNfa(14), k = 3, repeats = 3)
     )
   }
 
@@ -259,11 +293,18 @@ class P2TimingScreen extends RuntimeUtilTestSuite with PGPathPropagatingBFSTestB
 
   test("p2 timing screen") {
     val only = Option(System.getProperty("p2.workload"))
+    val onlyMany = Option(System.getProperty("p2.workloads")).map(_.split(",").toSet)
     val all = workloads()
-    val selected = only.map(id => all.filter(_.id == id)).getOrElse {
-      // seeded shuffle defeats order effects across forks; default seed keeps screening deterministic
-      val seed = Option(System.getProperty("p2.seed")).map(_.toLong).getOrElse(0L)
-      new scala.util.Random(seed).shuffle(all)
+    val selected = (only, onlyMany) match {
+      case (Some(id), _) => all.filter(_.id == id)
+      case (_, Some(ids)) =>
+        val missing = ids.filterNot(id => all.exists(_.id == id))
+        assert(missing.isEmpty, s"unknown p2.workloads=$missing")
+        all.filter(w => ids.contains(w.id))
+      case _ =>
+        // seeded shuffle defeats order effects across forks; default seed keeps screening deterministic
+        val seed = Option(System.getProperty("p2.seed")).map(_.toLong).getOrElse(0L)
+        new scala.util.Random(seed).shuffle(all)
     }
     assert(selected.nonEmpty, s"unknown p2.workload=$only")
     val variant = Option(System.getProperty("p2.variant")).getOrElse("unknown")
